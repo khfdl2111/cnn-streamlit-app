@@ -1,0 +1,105 @@
+# ============================================================
+# CNN for CIFAR-10  (simpan jadi: model_cnn.h5)
+# Cocok untuk Colab (aktifkan GPU: Runtime > Change runtime type > GPU)
+# ============================================================
+
+import tensorflow as tf
+import numpy as np
+import os, datetime
+from tensorflow.keras import layers, models
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+
+print("TensorFlow:", tf.__version__)
+
+# 1) Load dataset CIFAR-10
+#   50k train, 10k test, ukuran 32x32x3, 10 kelas
+(x_train, y_train), (x_test, y_test) = tf.keras.datasets.cifar10.load_data()
+x_train = x_train.astype("float32")/255.0
+x_test  = x_test.astype("float32")/255.0
+y_train = y_train.flatten()
+y_test  = y_test.flatten()
+
+# Split validasi dari train
+from sklearn.model_selection import train_test_split
+x_tr, x_val, y_tr, y_val = train_test_split(x_train, y_train, test_size=0.1, random_state=42, stratify=y_train)
+
+# 2) Augmentasi ringan (membantu generalisasi)
+datagen = ImageDataGenerator(
+    rotation_range=10,
+    width_shift_range=0.1,
+    height_shift_range=0.1,
+    horizontal_flip=True
+)
+datagen.fit(x_tr)
+
+# 3) Bangun arsitektur CNN (ringan + BatchNorm + Dropout)
+def build_model():
+    inputs = layers.Input(shape=(32,32,3))
+    x = layers.Conv2D(32, (3,3), padding="same", activation="relu")(inputs)
+    x = layers.BatchNormalization()(x)
+    x = layers.Conv2D(32, (3,3), padding="same", activation="relu")(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.MaxPooling2D()(x)
+    x = layers.Dropout(0.25)(x)
+
+    x = layers.Conv2D(64, (3,3), padding="same", activation="relu")(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Conv2D(64, (3,3), padding="same", activation="relu")(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.MaxPooling2D()(x)
+    x = layers.Dropout(0.3)(x)
+
+    x = layers.Conv2D(128, (3,3), padding="same", activation="relu")(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.MaxPooling2D()(x)
+    x = layers.Dropout(0.35)(x)
+
+    x = layers.Flatten()(x)
+    x = layers.Dense(256, activation="relu")(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Dropout(0.4)(x)
+    outputs = layers.Dense(10, activation="softmax")(x)
+    model = models.Model(inputs, outputs)
+    return model
+
+model = build_model()
+model.compile(optimizer=tf.keras.optimizers.Adam(1e-3),
+              loss="sparse_categorical_crossentropy",
+              metrics=["accuracy"])
+model.summary()
+
+# 4) Callback: early stopping + reduce LR + best checkpoint
+ckpt_path = "best_cifar10.h5"
+cbs = [
+    EarlyStopping(monitor="val_accuracy", patience=8, restore_best_weights=True),
+    ReduceLROnPlateau(monitor="val_loss", factor=0.5, patience=3),
+    ModelCheckpoint(ckpt_path, monitor="val_accuracy", save_best_only=True, verbose=1)
+]
+
+# 5) Train
+batch_size = 64
+epochs = 30  # boleh dinaikkan di GPU bagus
+history = model.fit(
+    datagen.flow(x_tr, y_tr, batch_size=batch_size, shuffle=True),
+    steps_per_epoch=len(x_tr)//batch_size,
+    epochs=epochs,
+    validation_data=(x_val, y_val),
+    callbacks=cbs,
+    verbose=1
+)
+
+# 6) Evaluasi singkat
+test_loss, test_acc = model.evaluate(x_test, y_test, verbose=0)
+print(f"Test accuracy: {test_acc:.4f}")
+
+# 7) Simpan model untuk Streamlit
+#    -> nama yang diharapkan app: model_cnn.h5
+model.save("model_cnn.h5")
+print("✅ Disimpan sebagai model_cnn.h5")
+
+# (opsional) Simpan juga label mapping
+class_names = ["airplane","automobile","bird","cat","deer","dog","frog","horse","ship","truck"]
+with open("labels.txt","w") as f:
+    f.write("\n".join(class_names))
+print("✅ Disimpan labels.txt")
