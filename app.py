@@ -179,9 +179,15 @@ st.caption(f"Input size model: {W}×{H}")
 
 uploaded = st.file_uploader("Pilih gambar...", type=["jpg", "jpeg", "png"])
 
-max_k = max(1, min(5, len(class_names)))
-default_k = min(3, max_k)
-top_k = st.slider("Tampilkan Top-k prediksi", min_value=1, max_value=max_k, value=default_k)
+num_classes = len(class_names)
+if num_classes < 2:
+    st.info("Model hanya memiliki 1 kelas. Top-k di-set otomatis ke 1.")
+    top_k = 1
+else:
+    max_k = min(5, num_classes)
+    default_k = min(3, max_k)
+    top_k = st.slider("Tampilkan Top-k prediksi",
+                      min_value=1, max_value=max_k, value=default_k)
 
 if uploaded:
     image = Image.open(uploaded)
