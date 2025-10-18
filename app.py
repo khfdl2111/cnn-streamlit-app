@@ -1,69 +1,104 @@
 # app.py
-# Streamlit web app: upload image -> CNN prediction (MobileNetV2-preprocessed)
+# Streamlit app with local-or-remote model loading
 # Run: streamlit run app.py
 
-import json
+import json, io, zipfile
 from pathlib import Path
 import numpy as np
 from PIL import Image
 import streamlit as st
 import tensorflow as tf
+import requests
 
-# --- Paths ---
 ROOT = Path(__file__).parent
-ARTIFACTS_DIRS = [ROOT / "artifacts", ROOT / "Artifacts"]  # handle case-sensitive mistakes
-
+ARTIFACTS_DIRS = [ROOT / "artifacts", ROOT / "Artifacts"]  # handle typo kapital
 MODEL_CANDIDATES = []
 for d in ARTIFACTS_DIRS:
-    MODEL_CANDIDATES += [
-        d / "model.keras",
-        d / "model.h5",
-        d / "saved_model",  # SavedModel dir
-    ]
-
+    MODEL_CANDIDATES += [d / "model.keras", d / "model.h5", d / "saved_model"]
 CLASS_CANDIDATES = [(d / "class_names.json") for d in ARTIFACTS_DIRS]
 
 st.set_page_config(page_title="CNN Image Classifier", page_icon="🧠", layout="centered")
 st.title("🧠 CNN Image Classifier (Streamlit)")
 st.write("Upload an image (JPG/PNG), the model will predict its class with confidence.")
 
-def _resolve_first_existing(paths):
+def _first_exists(paths):
     for p in paths:
         if p.exists():
             return p
     return None
 
+def _ensure_dir(p: Path):
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+def _download(url: str, dst: Path):
+    _ensure_dir(dst.parent)
+    with requests.get(url, stream=True, timeout=60) as r:
+        r.raise_for_status()
+        with open(dst, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+
+def _download_and_extract_zip(url: str, dst_dir: Path):
+    _ensure_dir(dst_dir)
+    with requests.get(url, stream=True, timeout=60) as r:
+        r.raise_for_status()
+        z = zipfile.ZipFile(io.BytesIO(r.content))
+        z.extractall(dst_dir)
+
 @st.cache_resource
 def load_model():
-    model_path = _resolve_first_existing(MODEL_CANDIDATES)
-    if model_path is None:
-        # List isi folder artifacts jika ada — biar mudah debug
-        existing = []
-        for d in ARTIFACTS_DIRS:
-            if d.exists():
-                existing += [str(p) for p in d.glob("**/*")]
-        msg = (
-            "Model tidak ditemukan. Pastikan salah satu path ini ADA:\n"
-            "- artifacts/model.keras\n"
-            "- artifacts/model.h5\n"
-            "- artifacts/saved_model (folder SavedModel)\n"
-            "Catatan: jika file >100MB, unggah via Git LFS."
-        )
-        st.error(msg)
-        if existing:
-            with st.expander("Lihat isi folder artifacts saat ini"):
-                st.write(existing)
-        st.stop()
+    # 1) coba lokal
+    local_model = _first_exists(MODEL_CANDIDATES)
+    if local_model is None:
+        # 2) coba unduh dari secrets
+        model_url = st.secrets.get("MODEL_URL", "").strip()
+        if model_url:
+            # tentukan target: file .keras/.h5 atau folder saved_model
+            if model_url.endswith((".keras", ".h5")):
+                target = ROOT / "artifacts" / ("model.keras" if model_url.endswith(".keras") else "model.h5")
+                try:
+                    _download(model_url, target)
+                    local_model = target
+                except Exception as e:
+                    st.error(f"Gagal mengunduh model: {e}")
+                    st.stop()
+            else:
+                # anggap ZIP SavedModel
+                target_dir = ROOT / "artifacts" / "saved_model"
+                try:
+                    _download_and_extract_zip(model_url, target_dir)
+                    local_model = target_dir
+                except Exception as e:
+                    st.error(f"Gagal mengunduh dan ekstrak SavedModel: {e}")
+                    st.stop()
+        else:
+            st.error(
+                "Model tidak ditemukan.\n"
+                "Letakkan salah satu dari ini di repo **atau** isi `MODEL_URL` di Secrets:\n"
+                "- artifacts/model.keras\n- artifacts/model.h5\n- artifacts/saved_model (folder SavedModel/ZIP URL)"
+            )
+            st.stop()
 
-    # SavedModel (folder) atau file tunggal
-    return tf.keras.models.load_model(str(model_path))
+    return tf.keras.models.load_model(str(local_model))
 
 @st.cache_data
 def load_classes():
-    classes_path = _resolve_first_existing(CLASS_CANDIDATES)
+    classes_path = _first_exists(CLASS_CANDIDATES)
     if classes_path is None:
-        st.error("`class_names.json` tidak ditemukan di folder artifacts/.")
-        st.stop()
+        classes_url = st.secrets.get("CLASSES_URL", "").strip()
+        if classes_url:
+            target = ROOT / "artifacts" / "class_names.json"
+            try:
+                _download(classes_url, target)
+                classes_path = target
+            except Exception as e:
+                st.error(f"Gagal mengunduh class_names.json: {e}")
+                st.stop()
+        else:
+            st.error("`class_names.json` tidak ditemukan di artifacts/. Atau isi `CLASSES_URL` di Secrets.")
+            st.stop()
     return json.loads(classes_path.read_text())
 
 def preprocess(img: Image.Image, size):
@@ -73,18 +108,14 @@ def preprocess(img: Image.Image, size):
     x = np.expand_dims(x, axis=0)
     return x
 
-# --- Load assets ---
+# Load artifacts
 model = load_model()
 class_names = load_classes()
-
-# Derive model input size
-ishape = model.inputs[0].shape
-H, W = int(ishape[1]), int(ishape[2])
+H, W = int(model.inputs[0].shape[1]), int(model.inputs[0].shape[2])
 st.caption(f"Input size model: {W}×{H}")
 
-# --- UI ---
 uploaded = st.file_uploader("Pilih gambar...", type=["jpg", "jpeg", "png"])
-top_k = st.slider("Tampilkan Top-k prediksi", min_value=1, max_value=min(5, len(class_names)), value=3)
+top_k = st.slider("Tampilkan Top-k prediksi", 1, min(5, len(class_names)), 3)
 
 if uploaded:
     image = Image.open(uploaded)
@@ -106,8 +137,5 @@ if uploaded:
     st.bar_chart(np.array([preds[i] for i in order]))
 
 st.markdown("---")
-st.caption(
-    "Tempatkan **model.keras**/**model.h5** atau **saved_model/** dan **class_names.json** di folder **artifacts/**. "
-    "Jika ukuran model >100MB, gunakan **Git LFS**."
-)
-
+st.caption("Letakkan model di **artifacts/** atau isi `MODEL_URL` dan `CLASSES_URL` di Secrets. "
+           "Jika ukuran model >100MB dan ingin commit ke repo, gunakan Git LFS.")
