@@ -9,27 +9,62 @@ from PIL import Image
 import streamlit as st
 import tensorflow as tf
 
-ARTIFACTS_DIR = Path("artifacts")
-MODEL_PATH = ARTIFACTS_DIR / "model.keras"
-CLASSES_PATH = ARTIFACTS_DIR / "class_names.json"
+# --- Paths ---
+ROOT = Path(__file__).parent
+ARTIFACTS_DIRS = [ROOT / "artifacts", ROOT / "Artifacts"]  # handle case-sensitive mistakes
+
+MODEL_CANDIDATES = []
+for d in ARTIFACTS_DIRS:
+    MODEL_CANDIDATES += [
+        d / "model.keras",
+        d / "model.h5",
+        d / "saved_model",  # SavedModel dir
+    ]
+
+CLASS_CANDIDATES = [(d / "class_names.json") for d in ARTIFACTS_DIRS]
 
 st.set_page_config(page_title="CNN Image Classifier", page_icon="🧠", layout="centered")
 st.title("🧠 CNN Image Classifier (Streamlit)")
 st.write("Upload an image (JPG/PNG), the model will predict its class with confidence.")
 
+def _resolve_first_existing(paths):
+    for p in paths:
+        if p.exists():
+            return p
+    return None
+
 @st.cache_resource
 def load_model():
-    if not MODEL_PATH.exists():
-        st.error("Model tidak ditemukan: artifacts/model.keras")
+    model_path = _resolve_first_existing(MODEL_CANDIDATES)
+    if model_path is None:
+        # List isi folder artifacts jika ada — biar mudah debug
+        existing = []
+        for d in ARTIFACTS_DIRS:
+            if d.exists():
+                existing += [str(p) for p in d.glob("**/*")]
+        msg = (
+            "Model tidak ditemukan. Pastikan salah satu path ini ADA:\n"
+            "- artifacts/model.keras\n"
+            "- artifacts/model.h5\n"
+            "- artifacts/saved_model (folder SavedModel)\n"
+            "Catatan: jika file >100MB, unggah via Git LFS."
+        )
+        st.error(msg)
+        if existing:
+            with st.expander("Lihat isi folder artifacts saat ini"):
+                st.write(existing)
         st.stop()
-    return tf.keras.models.load_model(MODEL_PATH)
+
+    # SavedModel (folder) atau file tunggal
+    return tf.keras.models.load_model(str(model_path))
 
 @st.cache_data
 def load_classes():
-    if not CLASSES_PATH.exists():
-        st.error("class_names.json tidak ditemukan di artifacts/")
+    classes_path = _resolve_first_existing(CLASS_CANDIDATES)
+    if classes_path is None:
+        st.error("`class_names.json` tidak ditemukan di folder artifacts/.")
         st.stop()
-    return json.loads(CLASSES_PATH.read_text())
+    return json.loads(classes_path.read_text())
 
 def preprocess(img: Image.Image, size):
     img = img.convert("RGB").resize(size)
@@ -38,14 +73,18 @@ def preprocess(img: Image.Image, size):
     x = np.expand_dims(x, axis=0)
     return x
 
+# --- Load assets ---
 model = load_model()
 class_names = load_classes()
-input_shape = model.inputs[0].shape
-H, W = int(input_shape[1]), int(input_shape[2])
+
+# Derive model input size
+ishape = model.inputs[0].shape
+H, W = int(ishape[1]), int(ishape[2])
 st.caption(f"Input size model: {W}×{H}")
 
-uploaded = st.file_uploader("Pilih gambar...", type=["jpg","jpeg","png"])
-top_k = st.slider("Tampilkan Top‑k prediksi", min_value=1, max_value=min(5, len(class_names)), value=3)
+# --- UI ---
+uploaded = st.file_uploader("Pilih gambar...", type=["jpg", "jpeg", "png"])
+top_k = st.slider("Tampilkan Top-k prediksi", min_value=1, max_value=min(5, len(class_names)), value=3)
 
 if uploaded:
     image = Image.open(uploaded)
@@ -56,9 +95,9 @@ if uploaded:
     order = np.argsort(preds)[::-1][:top_k]
 
     st.subheader("Hasil Prediksi")
-    st.write(f"Top‑1: **{class_names[order[0]]}** ({preds[order[0]]*100:.2f}%)")
+    st.write(f"Top-1: **{class_names[order[0]]}** ({preds[order[0]]*100:.2f}%)")
 
-    st.subheader("Confidence (Top‑k)")
+    st.subheader("Confidence (Top-k)")
     st.dataframe(
         {"class": [class_names[i] for i in order],
          "confidence": [float(preds[i]) for i in order]},
@@ -67,5 +106,8 @@ if uploaded:
     st.bar_chart(np.array([preds[i] for i in order]))
 
 st.markdown("---")
-st.caption("Letakkan **model.keras** dan **class_names.json** di folder **artifacts/**. "
-           "Latih model dulu dengan `train_transfer.py`.")
+st.caption(
+    "Tempatkan **model.keras**/**model.h5** atau **saved_model/** dan **class_names.json** di folder **artifacts/**. "
+    "Jika ukuran model >100MB, gunakan **Git LFS**."
+)
+
