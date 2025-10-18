@@ -1,39 +1,71 @@
+# app.py
+# Streamlit web app: upload image -> CNN prediction (MobileNetV2-preprocessed)
+# Run: streamlit run app.py
+
+import json
+from pathlib import Path
+import numpy as np
+from PIL import Image
 import streamlit as st
 import tensorflow as tf
-from PIL import Image
-import numpy as np
 
-CLASS_NAMES = ["airplane","automobile","bird","cat","deer","dog","frog","horse","ship","truck"]
+ARTIFACTS_DIR = Path("artifacts")
+MODEL_PATH = ARTIFACTS_DIR / "model.keras"
+CLASSES_PATH = ARTIFACTS_DIR / "class_names.json"
+
+st.set_page_config(page_title="CNN Image Classifier", page_icon="🧠", layout="centered")
+st.title("🧠 CNN Image Classifier (Streamlit)")
+st.write("Upload an image (JPG/PNG), the model will predict its class with confidence.")
 
 @st.cache_resource
 def load_model():
-    return tf.keras.models.load_model("model_cnn.h5")
+    if not MODEL_PATH.exists():
+        st.error("Model tidak ditemukan: artifacts/model.keras")
+        st.stop()
+    return tf.keras.models.load_model(MODEL_PATH)
+
+@st.cache_data
+def load_classes():
+    if not CLASSES_PATH.exists():
+        st.error("class_names.json tidak ditemukan di artifacts/")
+        st.stop()
+    return json.loads(CLASSES_PATH.read_text())
+
+def preprocess(img: Image.Image, size):
+    img = img.convert("RGB").resize(size)
+    x = np.array(img).astype("float32")
+    x = tf.keras.applications.mobilenet_v2.preprocess_input(x)
+    x = np.expand_dims(x, axis=0)
+    return x
 
 model = load_model()
+class_names = load_classes()
+input_shape = model.inputs[0].shape
+H, W = int(input_shape[1]), int(input_shape[2])
+st.caption(f"Input size model: {W}×{H}")
 
-st.title("🧠 CIFAR-10 Image Classifier (Streamlit)")
-st.write("Upload gambar (objek umum) ukuran bebas; app akan resize ke 32×32.")
+uploaded = st.file_uploader("Pilih gambar...", type=["jpg","jpeg","png"])
+top_k = st.slider("Tampilkan Top‑k prediksi", min_value=1, max_value=min(5, len(class_names)), value=3)
 
-uploaded_file = st.file_uploader("Pilih gambar", type=["jpg","jpeg","png"])
-if uploaded_file is not None:
-    img = Image.open(uploaded_file).convert("RGB")
-    st.image(img, caption="Gambar diunggah", use_column_width=True)
+if uploaded:
+    image = Image.open(uploaded)
+    st.image(image, caption="Gambar diunggah", use_container_width=True)
+    x = preprocess(image, (W, H))
+    with st.spinner("Memproses..."):
+        preds = model.predict(x, verbose=0)[0]
+    order = np.argsort(preds)[::-1][:top_k]
 
-    # Preprocess ke 32x32x3
-    img_resized = img.resize((32,32))
-    x = np.array(img_resized).astype("float32")/255.0
-    x = np.expand_dims(x, axis=0)
+    st.subheader("Hasil Prediksi")
+    st.write(f"Top‑1: **{class_names[order[0]]}** ({preds[order[0]]*100:.2f}%)")
 
-    # Prediksi
-    prob = model.predict(x)[0]       # shape (10,)
-    idx = int(np.argmax(prob))
-    conf = float(np.max(prob))*100.0
-    st.success(f"Prediksi: **{CLASS_NAMES[idx]}** ({conf:.2f}%)")
+    st.subheader("Confidence (Top‑k)")
+    st.dataframe(
+        {"class": [class_names[i] for i in order],
+         "confidence": [float(preds[i]) for i in order]},
+        use_container_width=True
+    )
+    st.bar_chart(np.array([preds[i] for i in order]))
 
-    # (opsional) tampilkan top-3
-    top3_idx = np.argsort(prob)[-3:][::-1]
-    st.write("Top-3:")
-    for i in top3_idx:
-        st.write(f"- {CLASS_NAMES[i]}: {prob[i]*100:.2f}%")
-else:
-    st.info("Silakan unggah gambar untuk klasifikasi.")
+st.markdown("---")
+st.caption("Letakkan **model.keras** dan **class_names.json** di folder **artifacts/**. "
+           "Latih model dulu dengan `train_transfer.py`.")
