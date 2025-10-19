@@ -2,6 +2,7 @@
 # Streamlit app: load model from (1) local artifacts, (2) Secrets URL, or (3) user upload via UI.
 # Run: streamlit run app.py
 
+from tensorflow.keras.applications import mobilenet_v2, efficientnet
 import json, io, zipfile, re
 from pathlib import Path
 import numpy as np
@@ -113,6 +114,20 @@ def load_model_and_classes():
         classes = [str(x) for x in data]
     return model, classes
 
+# tambahkan fungsi untuk deteksi backbone:
+def _detect_backbone(m):
+    name = (getattr(m, "name", "") or "").lower()
+    if "efficientnet" in name: 
+        return "efficientnet"
+    # fallback: cek nama layer
+    for lyr in m.layers:
+        if "efficientnet" in lyr.name.lower():
+            return "efficientnet"
+    return "mobilenet_v2"
+
+BACKBONE = _detect_backbone(model)
+st.caption(f"Backbone terdeteksi: {BACKBONE}")
+
 def _save_uploaded_model(file) -> Path:
     """Simpan file model yang di-upload ke artifacts/, dukung .keras/.h5/ZIP(SavedModel)."""
     artifacts = ROOT / "artifacts"
@@ -142,8 +157,12 @@ def preprocess(img: Image.Image, size_wh):
     W, H = size_wh
     img = img.convert("RGB")
     x = np.array(img).astype("float32")
-    x = tf.image.resize_with_pad(x, H, W).numpy()   # jaga rasio aspek
-    x = tf.keras.applications.mobilenet_v2.preprocess_input(x)
+    x = tf.image.resize_with_pad(x, H, W).numpy()
+    # pilih preprocessing sesuai backbone
+    if BACKBONE == "efficientnet":
+        x = efficientnet.preprocess_input(x)
+    else:
+        x = mobilenet_v2.preprocess_input(x)
     x = np.expand_dims(x, axis=0)
     return x
 
