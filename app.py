@@ -114,20 +114,6 @@ def load_model_and_classes():
         classes = [str(x) for x in data]
     return model, classes
 
-# tambahkan fungsi untuk deteksi backbone:
-def _detect_backbone(m):
-    name = (getattr(m, "name", "") or "").lower()
-    if "efficientnet" in name: 
-        return "efficientnet"
-    # fallback: cek nama layer
-    for lyr in m.layers:
-        if "efficientnet" in lyr.name.lower():
-            return "efficientnet"
-    return "mobilenet_v2"
-
-BACKBONE = _detect_backbone(model)
-st.caption(f"Backbone terdeteksi: {BACKBONE}")
-
 def _save_uploaded_model(file) -> Path:
     """Simpan file model yang di-upload ke artifacts/, dukung .keras/.h5/ZIP(SavedModel)."""
     artifacts = ROOT / "artifacts"
