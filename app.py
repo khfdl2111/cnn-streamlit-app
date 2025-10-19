@@ -1,34 +1,16 @@
 # app.py
-# Streamlit app: load model dari (1) artifacts lokal, (2) Secrets URL, atau (3) upload user.
-# Jalankan lokal: streamlit run app.py
+# Streamlit app: load model from (1) local artifacts, (2) Secrets URL, or (3) user upload via UI.
+# Run: streamlit run app.py
 
-import io, json, re, zipfile
+import json, io, zipfile, re
 from pathlib import Path
-
 import numpy as np
 from PIL import Image
-import requests
 import streamlit as st
 import tensorflow as tf
+import requests
 
-# ==== App config ====
-st.set_page_config(page_title="CNN Image Classifier", page_icon="🧠", layout="centered")
-st.title("🧠 CNN Image Classifier (Streamlit)")
-st.write("Upload gambar (JPG/PNG), aplikasi akan menampilkan prediksi model beserta confidence.")
-
-# ==== Imports & globals untuk preprocessing ====
-from tensorflow.keras.applications import mobilenet_v2
-try:
-    from tensorflow.keras.applications import efficientnet
-    HAS_EFN = True
-except Exception:
-    efficientnet = None
-    HAS_EFN = False
-
-# default; akan di-set ulang setelah model dimuat
-BACKBONE = "mobilenet_v2"
-
-# ==== Paths & candidates ====
+# -------------------- Paths & candidates --------------------
 ROOT = Path(__file__).parent
 ART_DIRS = [ROOT / "artifacts", ROOT / "Artifacts"]  # antisipasi typo kapital
 
@@ -43,7 +25,11 @@ for d in ART_DIRS:
     ]
 CLASS_CANDIDATES = [(d / "class_names.json") for d in ART_DIRS]
 
-# ==== Utils ====
+st.set_page_config(page_title="CNN Image Classifier", page_icon="🧠", layout="centered")
+st.title("🧠 CNN Image Classifier (Streamlit)")
+st.write("Upload an image (JPG/PNG), the model will predict its class with confidence.")
+
+# -------------------- Utils --------------------
 def _first_exists(paths):
     for p in paths:
         if p.exists():
@@ -67,22 +53,22 @@ def _fix_direct_url(url: str) -> str:
 def _download(url: str, dst: Path):
     _ensure_dir(dst.parent)
     url = _fix_direct_url(url)
-    with requests.get(url, stream=True, timeout=180) as r:
+    with requests.get(url, stream=True, timeout=120) as r:
         r.raise_for_status()
         with open(dst, "wb") as f:
-            for chunk in r.itercontent(chunk_size=1024 * 1024):
+            for chunk in r.itercontent(chunk_size=1024*1024):
                 if chunk:
                     f.write(chunk)
 
 def _download_and_extract_zip(url: str, dst_dir: Path) -> Path:
     _ensure_dir(dst_dir)
     url = _fix_direct_url(url)
-    with requests.get(url, stream=True, timeout=300) as r:
+    with requests.get(url, stream=True, timeout=180) as r:
         r.raise_for_status()
         z = zipfile.ZipFile(io.BytesIO(r.content))
         z.extractall(dst_dir)
     for p in dst_dir.rglob("saved_model.pb"):
-        return p.parent  # path folder SavedModel
+        return p.parent
     return dst_dir
 
 def _get_input_size(model, fallback=(224, 224)):
@@ -93,23 +79,14 @@ def _get_input_size(model, fallback=(224, 224)):
     except Exception:
         return fallback
 
-def _detect_backbone(m):
-    nm = (getattr(m, "name", "") or "").lower()
-    if "efficientnet" in nm:
-        return "efficientnet"
-    for lyr in m.layers:
-        if "efficientnet" in lyr.name.lower():
-            return "efficientnet"
-    return "mobilenet_v2"
-
-# ==== Loaders (cache) ====
+# -------------------- Loaders --------------------
 @st.cache_resource
 def load_model_and_classes():
-    # 1) Coba lokal
+    # 1) Local files?
     model_path = _first_exists(MODEL_CANDIDATES)
     classes_path = _first_exists(CLASS_CANDIDATES)
 
-    # 2) Coba dari Secrets URL (boleh kosongan)
+    # 2) Secrets URL?
     if model_path is None:
         model_url = (st.secrets.get("MODEL_URL", "") or "").strip()
         if model_url:
@@ -118,7 +95,6 @@ def load_model_and_classes():
                 _download(model_url, target)
                 model_path = target
             else:
-                # diasumsikan ZIP SavedModel
                 saved_dir = _download_and_extract_zip(model_url, ROOT / "artifacts" / "saved_model_zip")
                 model_path = saved_dir
 
@@ -132,23 +108,24 @@ def load_model_and_classes():
     model = tf.keras.models.load_model(str(model_path)) if model_path else None
     classes = None
     if classes_path and classes_path.exists():
-        raw = json.loads(classes_path.read_text())
-        classes = [str(x) for x in raw]
+        data = json.loads(classes_path.read_text())
+        # pastikan list of str
+        classes = [str(x) for x in data]
     return model, classes
 
 def _save_uploaded_model(file) -> Path:
-    """Simpan model upload ke artifacts/; dukung .keras/.h5 atau SavedModel.zip."""
+    """Simpan file model yang di-upload ke artifacts/, dukung .keras/.h5/ZIP(SavedModel)."""
     artifacts = ROOT / "artifacts"
     _ensure_dir(artifacts)
     name = file.name.lower()
     data = file.read()
     if name.endswith((".keras", ".h5")):
         out = artifacts / ("model.keras" if name.endswith(".keras") else "model.h5")
-        with open(out, "wb") as f:
-            f.write(data)
+        with open(out, "wb") as f: f.write(data)
         return out
-    # Asumsikan ZIP SavedModel
-    with zipfile.ZipFile(io.BytesIO(data)) as z:
+    # assume ZIP SavedModel
+    zip_bytes = io.BytesIO(data)
+    with zipfile.ZipFile(zip_bytes) as z:
         z.extractall(artifacts / "saved_model_upload")
     return artifacts / "saved_model_upload"
 
@@ -160,46 +137,43 @@ def _save_uploaded_classes(file) -> Path:
         f.write(file.read())
     return out
 
-# ==== Preprocess & TTA ====
+# --------- Preprocess tanpa distorsi (resize_with_pad) ---------
 def preprocess(img: Image.Image, size_wh):
-    """Resize tanpa distorsi + preprocessing sesuai backbone global."""
     W, H = size_wh
     img = img.convert("RGB")
     x = np.array(img).astype("float32")
-    x = tf.image.resize_with_pad(x, H, W).numpy()
-    if BACKBONE == "efficientnet" and HAS_EFN and efficientnet is not None:
-        x = efficientnet.preprocess_input(x)
-    else:
-        x = mobilenet_v2.preprocess_input(x)
-    x = np.expand_dims(x, 0)
+    x = tf.image.resize_with_pad(x, H, W).numpy()   # jaga rasio aspek
+    x = tf.keras.applications.mobilenet_v2.preprocess_input(x)
+    x = np.expand_dims(x, axis=0)
     return x
 
+# --------- Test-Time Augmentation (TTA) untuk inferensi yang lebih stabil ---------
 def predict_tta(pil_img, size_wh, rounds=4):
     W, H = size_wh
     cands = [
         pil_img,
         pil_img.transpose(Image.FLIP_LEFT_RIGHT),
-        pil_img.resize((W + 16, H + 16)).resize((W, H)),
-        pil_img.resize((W - 16, H - 16)).resize((W, H)),
+        pil_img.resize((W+16, H+16)).resize((W, H)),
+        pil_img.resize((W-16, H-16)).resize((W, H)),
     ][:rounds]
     ps = []
     for im in cands:
-        x = preprocess(im, size_wh)
+        x = preprocess(im, (W, H))
         ps.append(model.predict(x, verbose=0)[0])
     return np.mean(ps, axis=0)
 
-# ==== Main ====
-# 1) Load dari lokal / Secrets
+# -------------------- Main --------------------
+# Try load from local/Secrets
 model, class_names = None, None
 try:
     model, class_names = load_model_and_classes()
 except Exception:
     st.info("Belum ada model/kelas yang valid. Kamu bisa upload di bawah.")
 
-# 2) Jika belum ada, sediakan uploader
+# If not found, allow manual upload via UI
 if model is None or class_names is None:
     st.warning("Model/kelas belum tersedia. Upload di bawah atau perbaiki Secrets/letakkan file di artifacts/")
-    up_model = st.file_uploader("Upload model (.keras / .h5 / SavedModel.zip)", type=["keras", "h5", "zip"])
+    up_model = st.file_uploader("Upload model (.keras / .h5 / SavedModel.zip)", type=["keras","h5","zip"])
     up_classes = st.file_uploader("Upload class_names.json", type=["json"])
     if up_model and up_classes:
         try:
@@ -214,17 +188,14 @@ if model is None or class_names is None:
     else:
         st.stop()
 
-# 3) Deteksi backbone & guardrail jumlah kelas
-BACKBONE = _detect_backbone(model)  # set variabel global
-st.caption(f"Backbone terdeteksi: {BACKBONE}")
+# Guardrail: pastikan jumlah kelas = unit output
 if model.output_shape[-1] != len(class_names):
-    st.error(
-        f"Mismatch: output units model = {model.output_shape[-1]} ≠ jumlah classes = {len(class_names)}. "
-        "Upload class_names.json yang sesuai atau retrain model."
-    )
+    st.error(f"Mismatch: output units model = {model.output_shape[-1]} "
+             f"≠ jumlah classes = {len(class_names)}. "
+             "Upload class_names.json yang sesuai atau retrain model.")
     st.stop()
 
-# 4) UI prediksi
+# Ready to predict
 H, W = _get_input_size(model, fallback=(224, 224))
 st.caption(f"Input size model: {W}×{H}")
 
@@ -243,7 +214,7 @@ if uploaded:
     image = Image.open(uploaded)
     st.image(image, caption="Gambar diunggah", use_container_width=True)
     with st.spinner("Memproses..."):
-        preds = predict_tta(image, (W, H), rounds=4)
+        preds = predict_tta(image, (W, H), rounds=4)  # <-- pakai TTA
     order = np.argsort(preds)[::-1][:top_k]
 
     st.subheader("Hasil Prediksi")
@@ -251,13 +222,11 @@ if uploaded:
 
     st.subheader("Confidence (Top-k)")
     st.dataframe(
-        {"class": [class_names[i] for i in order], "confidence": [float(preds[i]) for i in order]},
-        use_container_width=True,
+        {"class": [class_names[i] for i in order],
+         "confidence": [float(preds[i]) for i in order]},
+        use_container_width=True
     )
     st.bar_chart(np.array([preds[i] for i in order]))
 
 st.markdown("---")
-st.caption(
-    "Sumber model: artifacts/ atau Secrets (MODEL_URL/CLASSES_URL). Jika keduanya tidak ada, gunakan uploader di atas. "
-    "Preprocess otomatis mengikuti backbone (MobileNetV2/EfficientNet) & memakai TTA."
-)
+st.caption("Sumber model: artifacts/ atau Secrets (MODEL_URL/CLASSES_URL). Jika keduanya tidak ada, gunakan uploader di atas.")
