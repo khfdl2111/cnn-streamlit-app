@@ -43,15 +43,11 @@ def _ensure_dir(p: Path):
 def _fix_direct_url(url: str) -> str:
     """Ubah link share Drive/Dropbox menjadi direct download."""
     if "drive.google.com" in url:
-        m = re.search(r"/d/([^/]+)/", url)
-        if m:
-            return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
-        m = re.search(r"[?&]id=([^&]+)", url)
+        m = re.search(r"/d/([^/]+)/", url) or re.search(r"[?&]id=([^&]+)", url)
         if m:
             return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
     if "dropbox.com" in url:
-        if "?dl=0" in url: return url.replace("?dl=0", "?dl=1")
-        if "?raw=0" in url: return url.replace("?raw=0", "?raw=1")
+        url = url.replace("?dl=0", "?dl=1").replace("?raw=0", "?raw=1")
     return url
 
 def _download(url: str, dst: Path):
@@ -60,7 +56,7 @@ def _download(url: str, dst: Path):
     with requests.get(url, stream=True, timeout=120) as r:
         r.raise_for_status()
         with open(dst, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1024*1024):
+            for chunk in r.itercontent(chunk_size=1024*1024):
                 if chunk:
                     f.write(chunk)
 
@@ -110,17 +106,19 @@ def load_model_and_classes():
             classes_path = target
 
     model = tf.keras.models.load_model(str(model_path)) if model_path else None
-    classes = json.loads(classes_path.read_text()) if classes_path and classes_path.exists() else None
+    classes = None
+    if classes_path and classes_path.exists():
+        data = json.loads(classes_path.read_text())
+        # pastikan list of str
+        classes = [str(x) for x in data]
     return model, classes
 
 def _save_uploaded_model(file) -> Path:
     """Simpan file model yang di-upload ke artifacts/, dukung .keras/.h5/ZIP(SavedModel)."""
     artifacts = ROOT / "artifacts"
     _ensure_dir(artifacts)
-
     name = file.name.lower()
     data = file.read()
-
     if name.endswith((".keras", ".h5")):
         out = artifacts / ("model.keras" if name.endswith(".keras") else "model.h5")
         with open(out, "wb") as f: f.write(data)
@@ -139,19 +137,37 @@ def _save_uploaded_classes(file) -> Path:
         f.write(file.read())
     return out
 
-def preprocess(img: Image.Image, size):
-    img = img.convert("RGB").resize(size)
+# --------- Preprocess tanpa distorsi (resize_with_pad) ---------
+def preprocess(img: Image.Image, size_wh):
+    W, H = size_wh
+    img = img.convert("RGB")
     x = np.array(img).astype("float32")
+    x = tf.image.resize_with_pad(x, H, W).numpy()   # jaga rasio aspek
     x = tf.keras.applications.mobilenet_v2.preprocess_input(x)
     x = np.expand_dims(x, axis=0)
     return x
+
+# --------- Test-Time Augmentation (TTA) untuk inferensi yang lebih stabil ---------
+def predict_tta(pil_img, size_wh, rounds=4):
+    W, H = size_wh
+    cands = [
+        pil_img,
+        pil_img.transpose(Image.FLIP_LEFT_RIGHT),
+        pil_img.resize((W+16, H+16)).resize((W, H)),
+        pil_img.resize((W-16, H-16)).resize((W, H)),
+    ][:rounds]
+    ps = []
+    for im in cands:
+        x = preprocess(im, (W, H))
+        ps.append(model.predict(x, verbose=0)[0])
+    return np.mean(ps, axis=0)
 
 # -------------------- Main --------------------
 # Try load from local/Secrets
 model, class_names = None, None
 try:
     model, class_names = load_model_and_classes()
-except Exception as e:
+except Exception:
     st.info("Belum ada model/kelas yang valid. Kamu bisa upload di bawah.")
 
 # If not found, allow manual upload via UI
@@ -159,19 +175,25 @@ if model is None or class_names is None:
     st.warning("Model/kelas belum tersedia. Upload di bawah atau perbaiki Secrets/letakkan file di artifacts/")
     up_model = st.file_uploader("Upload model (.keras / .h5 / SavedModel.zip)", type=["keras","h5","zip"])
     up_classes = st.file_uploader("Upload class_names.json", type=["json"])
-
     if up_model and up_classes:
         try:
             model_path = _save_uploaded_model(up_model)
             classes_path = _save_uploaded_classes(up_classes)
             model = tf.keras.models.load_model(str(model_path))
-            class_names = json.loads(classes_path.read_text())
+            class_names = [str(x) for x in json.loads(classes_path.read_text())]
             st.success("Model & class_names berhasil dimuat dari upload.")
         except Exception as e:
             st.error(f"Gagal memuat dari upload: {e}")
             st.stop()
     else:
         st.stop()
+
+# Guardrail: pastikan jumlah kelas = unit output
+if model.output_shape[-1] != len(class_names):
+    st.error(f"Mismatch: output units model = {model.output_shape[-1]} "
+             f"≠ jumlah classes = {len(class_names)}. "
+             "Upload class_names.json yang sesuai atau retrain model.")
+    st.stop()
 
 # Ready to predict
 H, W = _get_input_size(model, fallback=(224, 224))
@@ -186,15 +208,13 @@ if num_classes < 2:
 else:
     max_k = min(5, num_classes)
     default_k = min(3, max_k)
-    top_k = st.slider("Tampilkan Top-k prediksi",
-                      min_value=1, max_value=max_k, value=default_k)
+    top_k = st.slider("Tampilkan Top-k prediksi", min_value=1, max_value=max_k, value=default_k)
 
 if uploaded:
     image = Image.open(uploaded)
     st.image(image, caption="Gambar diunggah", use_container_width=True)
-    x = preprocess(image, (W, H))
     with st.spinner("Memproses..."):
-        preds = model.predict(x, verbose=0)[0]
+        preds = predict_tta(image, (W, H), rounds=4)  # <-- pakai TTA
     order = np.argsort(preds)[::-1][:top_k]
 
     st.subheader("Hasil Prediksi")
